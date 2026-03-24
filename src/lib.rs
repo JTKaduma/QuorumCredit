@@ -49,18 +49,18 @@ pub enum LoanStatus {
 
 #[contracttype]
 pub enum DataKey {
-    Loan(Address),    // borrower → LoanRecord
-    Vouches(Address), // borrower → Vec<VouchRecord>
-    Admin,            // Address allowed to call slash
-    Token,            // XLM token contract address
-    Deployer,         // Address that deployed the contract; guards initialize
-    SlashTreasury,    // i128 accumulated slashed funds
-    Paused,           // bool: true when contract is paused
-    ReputationNft,    // Address of the ReputationNftContract
-    Config,           // Config struct: all configurable protocol parameters
-    YieldBps,         // i128 yield in basis points
-    SlashBps,         // i128 slash penalty in basis points
-    PendingAdmin,     // Address of the pending admin (two-step transfer)
+    Loan(Address),           // borrower → LoanRecord
+    Vouches(Address),        // borrower → Vec<VouchRecord>
+    Admin,                   // Address allowed to call slash
+    Token,                   // XLM token contract address
+    Deployer,                // Address that deployed the contract; guards initialize
+    SlashTreasury,           // i128 accumulated slashed funds
+    Paused,                  // bool: true when contract is paused
+    ReputationNft,           // Address of the ReputationNftContract
+    Config,                  // Config struct: all configurable protocol parameters
+    YieldBps,                // i128 yield in basis points
+    SlashBps,                // i128 slash penalty in basis points
+    PendingAdmin,            // Address of the pending admin (two-step transfer)
     RepaymentCount(Address), // borrower → u32 total successful repayments
 }
 
@@ -1838,7 +1838,7 @@ mod tests {
         client.repay(&borrower);
         assert_eq!(client.repayment_count(&borrower), 1);
 
-        // Second loan cycle: request again (previous loan is repaid) -> repay.
+        // Second loan cycle: request again (ensure previous loan is repaid) -> repay.
         client.request_loan(&borrower, &500_000, &1_000_000);
         client.repay(&borrower);
         assert_eq!(client.repayment_count(&borrower), 2);
