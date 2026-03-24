@@ -31,6 +31,7 @@ pub enum ContractError {
     NoActiveLoan = 3,
     ContractPaused = 4,
     LoanPastDeadline = 5,
+    MinStakeNotMet = 6,
     UnauthorizedCaller = 6,
 }
 
@@ -66,6 +67,8 @@ pub enum DataKey {
     Deployer,         // Address that deployed the contract; guards initialize
     SlashTreasury,    // i128 accumulated slashed funds
     Paused,           // bool: true when contract is paused
+    LoanDuration,     // u64 configurable loan duration in seconds
+    MinStake,         // i128 minimum stake amount per vouch
     ReputationNft,    // Address of the ReputationNftContract
     Config,           // Config struct: all configurable protocol parameters
     YieldBps,         // i128 yield in basis points
@@ -182,6 +185,16 @@ impl QuorumCreditContract {
         Self::require_not_paused(&env)?;
 
         assert!(voucher != borrower, "voucher cannot vouch for self");
+
+        // Enforce minimum stake if configured.
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinStake)
+            .unwrap_or(0);
+        if stake < min_stake {
+            return Err(ContractError::MinStakeNotMet);
+        }
 
         let mut vouches: Vec<VouchRecord> = env
             .storage()
@@ -653,6 +666,29 @@ impl QuorumCreditContract {
             .remove(&DataKey::Vouches(borrower));
     }
 
+    /// Admin sets the minimum stake amount required per vouch (in stroops).
+    /// Set to 0 to disable the minimum.
+    pub fn set_min_stake(env: Env, amount: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(amount >= 0, "min stake cannot be negative");
+        env.storage().instance().set(&DataKey::MinStake, &amount);
+    }
+
+    /// Returns the current minimum vouch stake (0 means no minimum).
+    pub fn get_min_stake(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinStake)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the loan duration (in seconds) applied to future loans.
+    pub fn set_loan_duration(env: Env, duration_seconds: u64) {
     /// Admin updates configurable protocol parameters.
     pub fn set_config(env: Env, config: Config) {
         let admin: Address = env
@@ -925,6 +961,11 @@ mod tests {
         let contract_id = env.register_contract(None, QuorumCreditContract);
         token_admin.mint(&contract_id, &50_000_000);
 
+        // deployer == admin for test convenience; the key point is that
+        // deployer.require_auth() is satisfied via mock_all_auths().
+        // Set max_loan_to_stake_ratio to 150%.
+        QuorumCreditContractClient::new(env, &contract_id)
+            .initialize(&admin, &admin, &token_id.address(), &150);
         // deployer == admin for test convenience
         QuorumCreditContractClient::new(env, &contract_id).initialize(
             &admin,
@@ -1140,6 +1181,8 @@ mod tests {
         // Contract balance starts at 0; after vouch it will hold 1_000_000.
         // Request a loan larger than the contract balance to trigger InsufficientFunds.
 
+        QuorumCreditContractClient::new(&env, &contract_id)
+            .initialize(&admin, &admin, &token_id.address(), &150);
         QuorumCreditContractClient::new(&env, &contract_id).initialize(
             &admin,
             &admin,
@@ -1592,6 +1635,64 @@ mod tests {
         assert_eq!(client.get_admin(), admin);
     }
 
+    // ── Min Stake Tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_min_stake_defaults_to_zero() {
+        let env = Env::default();
+        let (contract_id, _, _, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_min_stake(), 0);
+    }
+
+    #[test]
+    fn test_set_min_stake_and_get() {
+        let env = Env::default();
+        let (contract_id, _, _, _, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_min_stake(&500_000);
+        assert_eq!(client.get_min_stake(), 500_000);
+    }
+
+    #[test]
+    fn test_vouch_below_min_stake_rejected() {
+        let env = Env::default();
+        let (contract_id, _, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_min_stake(&500_000);
+
+        let result = client.try_vouch(&voucher, &borrower, &100_000);
+        assert_eq!(result, Err(Ok(ContractError::MinStakeNotMet)));
+    }
+
+    #[test]
+    fn test_vouch_at_min_stake_succeeds() {
+        let env = Env::default();
+        let (contract_id, _, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_min_stake(&500_000);
+        client.vouch(&voucher, &borrower, &500_000);
+
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.len(), 1);
+    }
+
+    #[test]
+    fn test_vouch_above_min_stake_succeeds() {
+        let env = Env::default();
+        let (contract_id, _, _, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.set_min_stake(&500_000);
+        client.vouch(&voucher, &borrower, &1_000_000);
+
+        let vouches = client.get_vouches(&borrower).unwrap();
+        assert_eq!(vouches.len(), 1);
+        assert_eq!(vouches.get(0).unwrap().stake, 1_000_000);
     #[test]
     fn test_get_contract_balance() {
         let env = Env::default();
