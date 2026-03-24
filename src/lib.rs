@@ -57,6 +57,9 @@ pub enum DataKey {
     Paused,           // bool: true when contract is paused
     ReputationNft,    // Address of the ReputationNftContract
     Config,           // Config struct: all configurable protocol parameters
+    YieldBps,         // i128 yield in basis points
+    SlashBps,         // i128 slash penalty in basis points
+    PendingAdmin,     // Address of the pending admin (two-step transfer)
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -140,8 +143,14 @@ impl QuorumCreditContract {
             !env.storage().instance().has(&DataKey::Admin),
             "already initialized"
         );
-        assert!(yield_bps > 0 && yield_bps <= 10_000, "yield_bps must be in range 1..=10000");
-        assert!(slash_bps > 0 && slash_bps <= 10_000, "slash_bps must be in range 1..=10000");
+        assert!(
+            DEFAULT_YIELD_BPS > 0 && DEFAULT_YIELD_BPS <= 10_000,
+            "yield_bps must be in range 1..=10000"
+        );
+        assert!(
+            DEFAULT_SLASH_BPS > 0 && DEFAULT_SLASH_BPS <= 10_000,
+            "slash_bps must be in range 1..=10000"
+        );
 
         env.storage().instance().set(&DataKey::Deployer, &deployer);
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -344,12 +353,6 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        let yield_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::YieldBps)
-            .expect("not initialized");
-
         // Pre-calculate total payout to ensure contract has enough balance.
         let mut total_payout: i128 = 0;
         for v in vouches.iter() {
@@ -419,12 +422,6 @@ impl QuorumCreditContract {
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
-
-        let slash_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlashBps)
-            .expect("not initialized");
 
         for v in vouches.iter() {
             let slash_amount = v.stake * cfg.slash_bps / 10_000;
@@ -595,12 +592,6 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        let slash_bps: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SlashBps)
-            .expect("not initialized");
-
         for v in vouches.iter() {
             let slash_amount = v.stake * cfg.slash_bps / 10_000;
             let returned = v.stake - slash_amount;
@@ -708,7 +699,9 @@ impl QuorumCreditContract {
             .get(&DataKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(("AdminProposed",), (admin, new_admin));
     }
 
@@ -729,7 +722,8 @@ impl QuorumCreditContract {
 
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
-        env.events().publish(("AdminUpdated",), (old_admin, pending));
+        env.events()
+            .publish(("AdminUpdated",), (old_admin, pending));
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
