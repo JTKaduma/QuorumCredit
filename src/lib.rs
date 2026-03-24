@@ -696,7 +696,9 @@ impl QuorumCreditContract {
             .get(&DataKey::Admin)
             .expect("not initialized");
         admin.require_auth();
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(("AdminProposed",), (admin, new_admin));
     }
 
@@ -717,7 +719,8 @@ impl QuorumCreditContract {
 
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
-        env.events().publish(("AdminUpdated",), (old_admin, pending));
+        env.events()
+            .publish(("AdminUpdated",), (old_admin, pending));
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
