@@ -138,7 +138,8 @@ pub struct LoanRecord {
     pub borrower: Address,
     pub co_borrowers: Vec<Address>,
     pub amount: i128,        // total loan principal in stroops
-    pub amount_repaid: i128, // cumulative repayments received so far
+    pub amount_repaid: i128, // cumulative repayments received so far (principal + yield)
+    pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
     pub repaid: bool,
     pub defaulted: bool,
     pub created_at: u64,             // ledger timestamp
@@ -529,6 +530,10 @@ impl QuorumCreditContract {
         let now = env.ledger().timestamp();
         let deadline = now + cfg.loan_duration;
 
+        // Lock in the yield at disbursement time so rate changes mid-loan don't
+        // affect what the borrower owes or what vouchers receive (fixes issue #15).
+        let total_yield = amount * cfg.yield_bps / 10_000;
+
         env.storage().persistent().set(
             &DataKey::Loan(borrower.clone()),
             &LoanRecord {
@@ -536,6 +541,7 @@ impl QuorumCreditContract {
                 co_borrowers,
                 amount,
                 amount_repaid: 0,
+                total_yield,
                 repaid: false,
                 defaulted: false,
                 created_at: now,
@@ -567,11 +573,16 @@ impl QuorumCreditContract {
 
     /// Borrower repays all or part of the loan.
     ///
-    /// `payment` is the amount being paid in this call (in stroops). It must be
-    /// at least 1 stroop and cannot exceed the outstanding balance. When the
-    /// cumulative `amount_repaid` reaches `amount`, the loan is marked fully
-    /// repaid and each voucher receives their stake back plus a proportional
-    /// share of the yield (proportional to their stake / total_stake).
+    /// `payment` is the amount being paid in this call (in stroops). The total
+    /// amount the borrower must repay is `loan.amount + loan.total_yield` —
+    /// principal plus the yield owed to vouchers. Yield is locked in at
+    /// disbursement so the borrower's obligation is fixed from day one.
+    ///
+    /// When cumulative `amount_repaid` reaches `amount + total_yield`, the loan
+    /// is marked fully repaid and each voucher receives their stake back plus
+    /// their proportional share of `total_yield`. Because yield comes entirely
+    /// from the borrower's repayment, no pre-funded contract balance is consumed
+    /// (fixes issue #15).
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
         // ── CHECKS ────────────────────────────────────────────────────────────
         borrower.require_auth();
@@ -598,27 +609,29 @@ impl QuorumCreditContract {
         }
 
         // Block repayment after deadline — borrower must be auto-slashed instead.
-        assert!(!loan.defaulted, "loan already defaulted");
-        assert!(!loan.repaid, "loan already repaid");
         assert!(
             env.ledger().timestamp() <= loan.deadline,
             "loan deadline has passed"
         );
 
-        let outstanding = loan.amount - loan.amount_repaid;
+        // Total obligation = principal + yield locked in at disbursement.
+        let total_owed = loan.amount + loan.total_yield;
+        let outstanding = total_owed - loan.amount_repaid;
         assert!(
             payment > 0 && payment <= outstanding,
             "invalid payment amount"
         );
 
-        let token = Self::token_client(&env);
+        let token = Self::token(&env);
+
+        // Collect this installment from the borrower (principal + yield portion).
         token.transfer(&borrower, &env.current_contract_address(), &payment);
         loan.amount_repaid += payment;
 
-        let fully_repaid = loan.amount_repaid >= loan.amount;
-
-        if fully_repaid {
-            let cfg = Self::config(&env);
+        if loan.amount_repaid >= total_owed {
+            // Fully repaid — distribute stake + proportional yield to each voucher.
+            // Yield comes entirely from what the borrower just paid in, so no
+            // pre-funded contract balance is consumed.
             let vouches: Vec<VouchRecord> = env
                 .storage()
                 .persistent()
@@ -626,29 +639,11 @@ impl QuorumCreditContract {
                 .unwrap_or(Vec::new(&env));
 
             let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
-            let total_yield = loan.amount * cfg.yield_bps / 10_000;
-        }
 
-            // ── Pre-calculate total payout and assert contract has sufficient balance ──
-            // This prevents a mid-loop panic if the contract balance is insufficient
-            // to cover stake + yield for all vouchers (fixes issue #10).
-            let total_payout: i128 = vouches.iter().map(|v| {
-                let voucher_yield = if total_stake > 0 {
-                    total_yield * v.stake / total_stake
-                } else {
-                    0
-                };
-                v.stake + voucher_yield
-            }).sum();
-            let contract_balance = token.balance(&env.current_contract_address());
-            if contract_balance < total_payout {
-                return Err(ContractError::InsufficientFunds);
-            }
-
-            // Return stake + yield to each voucher.
+            // Return stake + proportional share of total_yield to each voucher.
             for v in vouches.iter() {
                 let voucher_yield = if total_stake > 0 {
-                    total_yield * v.stake / total_stake
+                    loan.total_yield * v.stake / total_stake
                 } else {
                     0
                 };
@@ -686,7 +681,7 @@ impl QuorumCreditContract {
             );
         }
 
-        // Persist the updated loan record (amount_repaid + repaid flag).
+        // Persist the updated loan record.
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
@@ -837,27 +832,35 @@ impl QuorumCreditContract {
         Self::token_client(&env).transfer(&env.current_contract_address(), &recipient, &amount);
     }
 
-    pub fn withdraw_vouch(env: Env, voucher: Address, borrower: Address) {
+    /// Withdraw a vouch before any loan is active, returning the exact stake to the voucher.
+    ///
+    /// Fails with `ContractError::PoolBorrowerActiveLoan` if the borrower currently
+    /// has an active (non-repaid, non-defaulted) loan. Repaid or defaulted loan
+    /// records in storage do not block withdrawal.
+    pub fn withdraw_vouch(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
         voucher.require_auth();
+        Self::require_not_paused(&env)?;
 
-        assert!(
-            env.storage()
-                .persistent()
-                .get::<DataKey, LoanRecord>(&DataKey::Loan(borrower.clone()))
-                .is_none(),
-            "loan already active"
-        );
+        // Block only while a loan is genuinely active; repaid/defaulted records
+        // in storage must not permanently lock voucher funds (fixes issue #14).
+        if Self::has_active_loan(&env, &borrower) {
+            return Err(ContractError::PoolBorrowerActiveLoan);
+        }
 
         let mut vouches: Vec<VouchRecord> = env
             .storage()
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
-            .expect("vouch not found");
+            .ok_or(ContractError::NoActiveLoan)?; // reuse: "no vouch found"
 
         let idx = vouches
             .iter()
             .position(|v| v.voucher == voucher)
-            .expect("vouch not found") as u32;
+            .ok_or(ContractError::UnauthorizedCaller)? as u32;
 
         let stake = vouches.get(idx).unwrap().stake;
         vouches.remove(idx);
@@ -865,14 +868,21 @@ impl QuorumCreditContract {
         if vouches.is_empty() {
             env.storage()
                 .persistent()
-                .remove(&DataKey::Vouches(borrower));
+                .remove(&DataKey::Vouches(borrower.clone()));
         } else {
             env.storage()
                 .persistent()
-                .set(&DataKey::Vouches(borrower), &vouches);
+                .set(&DataKey::Vouches(borrower.clone()), &vouches);
         }
 
         Self::token(&env).transfer(&env.current_contract_address(), &voucher, &stake);
+
+        env.events().publish(
+            (symbol_short!("vouch"), symbol_short!("withdrawn")),
+            (voucher, borrower, stake),
+        );
+
+        Ok(())
     }
 
     /// Transfer ownership of a stake position for a borrower from one address to another.
@@ -1528,6 +1538,7 @@ impl QuorumCreditContract {
                     co_borrowers: Vec::new(&env), // pools currently only use single borrowers
                     amount,
                     amount_repaid: 0,
+                    total_yield: amount * cfg.yield_bps / 10_000,
                     repaid: false,
                     defaulted: false,
                     created_at: now,
